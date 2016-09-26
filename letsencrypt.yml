@@ -1,0 +1,260 @@
+#!/usr/bin/env ansible-playbook
+---
+
+- name: Create a staging machine
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tags: machine, setup
+
+  tasks:
+  - name: Fail if letsencrypt email is not provided
+    fail: 
+      msg: "you must provide an email for usage with letsencrypt"
+    when: use_letsencrypt and (letsencrypt_email == '' or letsencrypt_email is undefined)
+
+  - name: Fail if domain name is not provided
+    fail: 
+      msg: "you must provide an email for usage with letsencrypt"
+    when: (domains == '' or domains is undefined)
+
+  - name: Use ec2 key
+    ec2_key:
+      name: "{{ letsencrypt_tag }}"
+      region: "{{ region }}"
+      key_material: "{{ item }}"
+    with_file: "{{ keyfile }}"
+
+  - name: Create iam role
+    iam:
+      iam_type: role
+      name: "{{ letsencrypt_tag }}"
+      state: present
+
+  - name: Create iam policy
+    tags: lets
+    iam_policy:
+      iam_type: role
+      iam_name: "{{ letsencrypt_tag }}"
+      policy_name: "{{ letsencrypt_tag }}"
+      state: present
+      policy_document: files/letsencrypt.json
+
+  - name: Create VPC
+    ec2_vpc:
+      state: present
+      cidr_block: 172.22.1.0/24
+      resource_tags: { "Name": "{{ letsencrypt_tag }}" }
+      region: "{{ region }}"
+      internet_gateway: True
+      subnets:
+        - cidr: 172.22.1.0/24
+          az: "{{ region }}a"
+          resource_tags: { "Name": "{{ letsencrypt_tag }}" }
+      route_tables:
+        - subnets: 
+          - 172.22.1.0/24
+          routes:
+            - dest: 0.0.0.0/0
+              gw: igw
+    register: vpc
+
+  - name: Create ec2 security group
+    ec2_group:
+      name: "{{ letsencrypt_tag }}"
+      description: "Temporary security group for letsencrypt"
+      region: "{{ region }}"
+      vpc_id: "{{ vpc.vpc.id }}"
+      rules:
+        - proto: tcp
+          from_port: 22
+          to_port: 22
+          cidr_ip: 0.0.0.0/0
+        - proto: tcp
+          from_port: 443
+          to_port: 443
+          cidr_ip: 0.0.0.0/0
+    register: sg
+
+  - name: Create ec2 instance
+    ec2:
+      key_name: "{{ letsencrypt_tag }}"
+      image: "{{ image }}"
+      instance_type: "{{ letsencrypt_instance_type }}"
+      region: "{{ region }}"
+      termination_protection: no
+      assign_public_ip: yes
+      instance_profile_name: "{{ letsencrypt_tag }}"
+      group_id: "{{ sg.group_id }}"
+      vpc_subnet_id: "{{ vpc.subnets[0].id }}"
+      exact_count: 1
+      instance_tags:
+        Name: "{{ letsencrypt_tag }}"
+      count_tag:
+        Name: "{{ letsencrypt_tag }}"
+    register: ec2
+
+  - name: Wait for SSH to come up
+    wait_for: 
+      host: "{{ item.public_ip }}"
+      port: 22
+      delay: 20
+      timeout: 320
+      state: started
+    with_items: "{{ ec2.instances }}"
+
+  - name: Wait for the port a bit longer
+    pause: 
+      seconds: 120
+
+  - name: Refresh EC2 inventory
+    shell: inventory/ec2.py --refresh-cache
+
+  # - name: Refresh EC2 inventory
+  #   meta: refresh_inventory
+
+
+- name: Install and configure letsencrypt.
+  hosts: "tag_Name_{{ letsencrypt_tag }}"
+  connection: ssh
+  user: ubuntu
+  gather_facts: no
+  vars_files:
+  - "group_vars/all.yml"
+  tags: lets
+
+  pre_tasks:
+  - name: Install python in raw mode
+    become: yes
+    raw: sudo apt-get install -y python
+
+  tasks:
+  - name: Install letsencrypt
+    become: yes
+    apt: 
+      pkg: letsencrypt
+      state: present
+
+  - name: Install boto and awscli
+    become: yes
+    apt: 
+      pkg: "{{ item }}"
+      state: present
+    with_items:
+      - python-boto
+      - awscli
+
+  - name: Enter domains into route53
+    route53:
+      command: create
+      zone: "{{ item | regex_replace('^\\w*\\.', '') }}"
+      record: "{{ item }}"
+      type: A
+      ttl: 7200
+      value: "{{ inventory_hostname }}"
+      wait: yes
+      overwrite: yes
+    with_items: "{{ domains }}"
+
+  - name: Register presence of certificates
+    become: yes
+    stat: 
+      path: /etc/letsencrypt/live/{{ domains[0] }}/cert.pem
+    register: letsencrypt_cert
+
+  - name: Run letsencrypt to generate SSL certs
+    command: letsencrypt certonly --standalone --standalone-supported-challenges tls-sni-01 --agree-tos -m {{ letsencrypt_email }} -d {{ item }}
+    args:
+      chdir: /tmp
+      creates: /etc/letsencrypt/live/{{ item }}/
+    become: true
+    when: use_letsencrypt and letsencrypt_cert.stat.exists == False
+    with_items: "{{ domains }}"
+
+  - name: Remove domains from route53
+    route53:
+      command: delete
+      zone: "{{ item | regex_replace('^\\w*\\.', '') }}"
+      record: "{{ item }}"
+      type: A
+      value: "{{ inventory_hostname }}"
+    with_items: "{{ domains }}"
+
+  - name: Remove old certificate if it exists
+    become: yes
+    command: >
+      aws iam delete-server-certificate 
+        --server-certificate-name "{{ item | regex_replace('\\.', '-') }}"
+    ignore_errors: yes
+    with_items: "{{ domains }}" 
+
+  - name: Add the certificate to AWS
+    become: yes
+    command: > 
+      aws iam upload-server-certificate
+        --server-certificate-name "{{ item | regex_replace('\\.', '-') }}"
+        --certificate-body file:///"{{ cert_path }}{{ item }}/cert.pem"
+        --private-key file:///"{{ cert_path }}{{ item }}/privkey.pem"
+        --certificate-chain file:///"{{ cert_path }}{{ item }}/chain.pem"
+        --path /"{{ item }}"/
+    with_items: "{{ domains }}"
+
+
+- name: Remove the staging machine
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tags: machine, cleanup
+
+  tasks:
+  - name: Gather remote facts
+    ec2_remote_facts:
+      region: "{{ region }}"
+      filters:
+        instance-state-name: running
+        "tag:Name": "{{ letsencrypt_tag }}"
+    register: ec2
+  
+  - name: Terminate instance
+    ec2:
+      state: absent
+      region: "{{ region }}"
+      instance_ids: "{{ item.id }}"
+    with_items: "{{ ec2.instances }}"
+
+  - name: Use ec2 key
+    ec2_key:
+      name: "{{ letsencrypt_tag }}"
+      region: "{{ region }}"
+      state: absent
+
+  - name: Wait for the instance to terminate
+    pause: 
+      seconds: 60
+
+  - name: Terminate security group
+    ec2_group:
+      name: "{{ letsencrypt_tag }}"
+      state: absent
+      region: "{{ region }}"
+      description: "{{ letsencrypt_tag }} certificate generation"
+
+  - name: Terminate vpc
+    ec2_vpc:
+      state: absent
+      cidr_block: 172.22.1.0/24
+      resource_tags: { "Name": "{{ letsencrypt_tag }}" }
+      region: "{{ region }}"
+
+  - name: Terminate iam policy
+    iam_policy:
+      iam_type: role
+      iam_name: "{{ letsencrypt_tag }}"
+      policy_name: "{{ letsencrypt_tag }}"
+      state: absent
+
+  - name: Terminate iam role
+    iam:
+      iam_type: role
+      name: "{{ letsencrypt_tag }}"
+      state: absent
